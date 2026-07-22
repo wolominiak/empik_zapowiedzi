@@ -1,30 +1,28 @@
-name: Empik zapowiedzi scraper
+name: Empik zapowiedzi do Supabase
 
 on:
   schedule:
-    # 3x dziennie (UTC): 10:43, 15:43, 20:43 - "krzywe" minuty omijaja tlok pelnych godzin
-    - cron: "43 10,15,20 * * *"
-  # Reczne uruchomienie z zakladki Actions - kluczowe do debugowania
-  workflow_dispatch:
+    - cron: "43 10,15,20 * * *" # 3x dziennie (UTC)
+  workflow_dispatch: {}
+
+concurrency:
+  group: empik-zapowiedzi
+  cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Pobierz kod
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-node@v5
         with:
-          python-version: "3.12"
+          node-version: 24
 
-      - name: Zaleznosci
-        run: pip install -r requirements.txt
+      - run: npm install
 
-      - name: Scraper
+      - name: Run scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python scraper.py
+        run: node scraper.js
