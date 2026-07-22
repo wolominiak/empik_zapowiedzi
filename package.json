@@ -1,12 +1,13 @@
 {
   "name": "empik-zapowiedzi",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "private": true,
   "scripts": {
     "start": "node scraper.js"
   },
   "dependencies": {
-    "cheerio": "^1.0.0"
+    "cheerio": "^1.0.0",
+    "playwright": "^1.48.0"
   }
 }

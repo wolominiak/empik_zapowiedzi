@@ -1,95 +1,25 @@
-// Empik Zapowiedzi → Supabase (zaczytajsie.pl)
-// Pobiera listing zapowiedzi Empiku, doczytuje ze stron produktowych komplet
-// danych (autor, okładka, EAN, data premiery, opis) i upsertuje do tabeli
-// empik_proposals w Supabase. Panel admina czyta z tej tabeli.
+// Empik Zapowiedzi → Supabase (zaczytajsie.pl) — wersja Playwright
+// Używa prawdziwej przeglądarki (headless Chromium), żeby ominąć blokadę 403
+// na stronach produktów. Logika parsowania i zapisu jak w wersji fetch.
 //
 // Wymagane sekrety (env): SUPABASE_URL, SUPABASE_SERVICE_KEY
 
+import { chromium } from "playwright";
 import * as cheerio from "cheerio";
 
 const LISTING_URL =
   "https://www.empik.com/zapowiedzi?searchCategory=31&hideUnavailable=true&sort=scoreDesc&availabilitySeparable=przedsprzedaz&qtype=facetForm";
 
-const MAX_PAGES = 5;
+const MAX_PAGES = 8; // 8 × 50 = do 400 pozycji (stop na pustej stronie)
 const RESULTS_PER_PAGE = 50;
-const DETAILS_BUDGET = 50; // max stron produktowych na jeden run
+const DETAILS_BUDGET = 60; // max stron produktowych na jeden run
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
-const HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-  "Accept":
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-  "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Upgrade-Insecure-Requests": "1",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "same-origin",
-  "Sec-Fetch-User": "?1",
-  "sec-ch-ua": '"Chromium";v="126", "Not:A-Brand";v="24", "Google Chrome";v="126"',
-  "sec-ch-ua-mobile": "?0",
-  "sec-ch-ua-platform": '"Windows"',
-  "Cache-Control": "max-age=0",
-};
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Prosty magazyn ciasteczek — Empik ustawia sesyjne cookies na pierwszej
-// odsłonie i wymaga ich odesłania przy kolejnych żądaniach (inaczej 403).
-let COOKIE_JAR = "";
-
-function storeCookies(res) {
-  // Node fetch: nagłówki set-cookie dostępne przez getSetCookie()
-  const setCookies =
-    (res.headers.getSetCookie && res.headers.getSetCookie()) ||
-    (res.headers.raw && res.headers.raw()["set-cookie"]) ||
-    [];
-  if (!setCookies || setCookies.length === 0) return;
-  const jar = {};
-  for (const c of COOKIE_JAR.split("; ").filter(Boolean)) {
-    const [k, ...v] = c.split("=");
-    jar[k] = v.join("=");
-  }
-  for (const line of setCookies) {
-    const first = line.split(";")[0];
-    const [k, ...v] = first.split("=");
-    if (k) jar[k.trim()] = v.join("=");
-  }
-  COOKIE_JAR = Object.entries(jar)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
-
-// Fetch z nagłówkami przeglądarki, ciasteczkami i ponawianiem przy 403/429.
-async function browserFetch(url, { referer } = {}, attempt = 0) {
-  const headers = { ...HEADERS };
-  if (referer) headers["Referer"] = referer;
-  if (COOKIE_JAR) headers["Cookie"] = COOKIE_JAR;
-  const res = await fetch(url, { headers, redirect: "follow" });
-  storeCookies(res);
-  if ((res.status === 403 || res.status === 429) && attempt < 3) {
-    await sleep(3000 + attempt * 3000 + Math.random() * 2000);
-    return browserFetch(url, { referer }, attempt + 1);
-  }
-  return res;
-}
-
-// Rozgrzewka: wejście na stronę główną, by pobrać sesyjne ciasteczka.
-async function warmUp() {
-  try {
-    const res = await browserFetch("https://www.empik.com/");
-    console.log(`Rozgrzewka: HTTP ${res.status}, cookies: ${COOKIE_JAR ? "tak" : "brak"}`);
-    await sleep(1500 + Math.random() * 1500);
-  } catch (e) {
-    console.warn(`Rozgrzewka nieudana: ${e.message}`);
-  }
-}
-
-
-// ---------- Supabase (REST, bez zależności) ----------
+// ---------- Supabase (REST) ----------
 
 async function sb(path, options = {}) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
@@ -110,7 +40,6 @@ async function sb(path, options = {}) {
 }
 
 async function getExisting() {
-  // Pobieramy id + details_ok wszystkich rekordów (paczkami po 1000)
   const map = new Map();
   let from = 0;
   while (true) {
@@ -133,14 +62,28 @@ async function upsertRows(rows) {
   });
 }
 
-// ---------- Listing ----------
+// ---------- Pobieranie przez przeglądarkę ----------
 
-async function fetchListingPage(startPos) {
-  const url = `${LISTING_URL}&resultsPP=${RESULTS_PER_PAGE}&start=${startPos}`;
-  const res = await browserFetch(url, { referer: "https://www.empik.com/" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} dla start=${startPos}`);
-  return await res.text();
+async function getHtml(page, url, { waitFor } = {}) {
+  const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  const status = resp ? resp.status() : 0;
+  if (status === 403 || status === 429) {
+    await sleep(4000 + Math.random() * 3000);
+    const resp2 = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    if (resp2 && (resp2.status() === 403 || resp2.status() === 429)) {
+      throw new Error(`HTTP ${resp2.status()}`);
+    }
+  }
+  if (waitFor) {
+    try {
+      await page.waitForSelector(waitFor, { timeout: 8000 });
+    } catch {}
+  }
+  await sleep(400);
+  return await page.content();
 }
+
+// ---------- Listing ----------
 
 function parseListing(html) {
   const $ = cheerio.load(html);
@@ -167,7 +110,7 @@ function parseListing(html) {
   return products;
 }
 
-// ---------- Strona produktu: komplet danych ----------
+// ---------- Helpery parsujące ----------
 
 function normalizeDate(s) {
   if (!s) return null;
@@ -183,27 +126,33 @@ function cleanText(s, max) {
   return (s || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-// Czyści tytuł z og:title: ucina końcówki typu " - Autor", " - Książka",
-// oraz sufiks " | Empik.com" / " | Empik".
 function cleanOgTitle(raw) {
   let t = cleanText(raw, 400);
   t = t.replace(/\s*\|\s*Empik(\.com)?\s*$/i, "");
-  // "Tytuł - Książka" → "Tytuł"
   t = t.replace(/\s*-\s*Książka\s*$/i, "");
   return cleanText(t, 300);
 }
 
-// Empik w og:image podaje URL z parametrem rozmiaru (np. ...,w-360).
-// Podnosimy do największego dostępnego wariantu.
 function upscaleCover(u) {
   if (!u) return u;
   return u
-    .replace(/,(?:w|h)-\d+/gi, "")           // usuń parametry rozmiaru w slug
-    .replace(/([?&])(?:w|h|width|height|size)=\d+/gi, "$1") // i w query
+    .replace(/,(?:w|h)-\d+/gi, "")
+    .replace(/([?&])(?:w|h|width|height|size)=\d+/gi, "$1")
     .replace(/[?&]+$/, "");
 }
 
-async function fetchProductDetails(p) {
+function isValidCover(u) {
+  if (!u) return false;
+  try {
+    return new URL(u).host.includes("ecsmedia.pl");
+  } catch {
+    return false;
+  }
+}
+
+// ---------- Strona produktu: komplet danych ----------
+
+function extractDetails(html) {
   const out = {
     author: null,
     cover_url: null,
@@ -211,7 +160,7 @@ async function fetchProductDetails(p) {
     release_date: null,
     description: null,
     category: null,
-    title: null, // ustalamy ze strony produktu (JSON-LD/og:title), nie z listingu
+    title: null,
     details_ok: false,
   };
   const SKIP_CRUMBS = new Set([
@@ -219,9 +168,6 @@ async function fetchProductDetails(p) {
     "zapowiedzi", "przedsprzedaż", "bestsellery", "nowości", "promocje",
   ]);
 
-  const res = await browserFetch(p.url, { referer: LISTING_URL });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const html = await res.text();
   const $ = cheerio.load(html);
 
   // 1) JSON-LD: Product / Book / BreadcrumbList
@@ -243,11 +189,11 @@ async function fetchProductDetails(p) {
         const img = Array.isArray(node.image) ? node.image[0] : node.image;
         const imgUrl = typeof img === "string" ? img : img?.url || null;
         if (imgUrl && !out.cover_url) out.cover_url = imgUrl;
-        // EAN: akceptujemy tylko poprawny 13-cyfrowy kod
         const eanCand = String(node.gtin13 || node.gtin || node.isbn || "").replace(/\D/g, "");
         if (!out.ean && /^\d{13}$/.test(eanCand)) out.ean = eanCand;
         const rd = node.releaseDate || node.datePublished;
         if (rd) out.release_date = normalizeDate(String(rd)) || out.release_date;
+        // Autor WYŁĄCZNIE z JSON-LD (naturalna forma "Imię Nazwisko")
         const authors = [].concat(node.author || []).map((a) =>
           typeof a === "string" ? a : a?.name || ""
         );
@@ -269,39 +215,32 @@ async function fetchProductDetails(p) {
     }
   });
 
-  // 2) Fallbacki i doprecyzowanie z HTML/meta
-
-  // Kategoria: surowa z meta product:category2 (np. "Kryminał, sensacja, thriller").
-  // NIE mapujemy tu na gatunki portalu — to robi panel admina.
+  // 2) Fallbacki z meta/HTML
   if (!out.category) {
     const cat =
       $("meta[property='product:category2']").attr("content") ||
       $("meta[property='product:category']").attr("content");
     if (cat) out.category = cleanText(cat, 80);
   }
-  // Fallback kategorii: przedostatni okruszek z breadcrumbów (już policzony wyżej)
 
-  // Tytuł: jeśli JSON-LD nie dał, bierzemy og:title z uciętą końcówką " - Autor"/" - Książka".
   if (!out.title) {
     const ogTitle = cleanOgTitle($("meta[property='og:title']").attr("content"));
     if (ogTitle) out.title = ogTitle;
   }
 
-  // Okładka: og:image z hosta ecsmedia.pl, podniesiona do największego rozmiaru.
   const ogImage = $("meta[property='og:image']").attr("content") || null;
   const coverCandidate = ogImage || out.cover_url;
   out.cover_url = isValidCover(coverCandidate) ? upscaleCover(coverCandidate) : null;
 
-  // Opis: pełny ze strony; og:description tylko jako ostateczność (bywa skrócony).
   if (!out.description) {
-    out.description = cleanText(
-      $("meta[property='og:description']").attr("content") ||
-        $("meta[name='description']").attr("content"),
-      3000
-    ) || null;
+    out.description =
+      cleanText(
+        $("meta[property='og:description']").attr("content") ||
+          $("meta[name='description']").attr("content"),
+        3000
+      ) || null;
   }
 
-  // EAN: 13 cyfr; szukamy w sekcji szczegółów, potem w całym HTML.
   if (!out.ean) {
     const detail = $("body").text().replace(/\s+/g, " ");
     let m = detail.match(/\bEAN\D{0,15}(\d{13})\b/i) || detail.match(/\bISBN\D{0,15}(\d{13})\b/i);
@@ -309,43 +248,25 @@ async function fetchProductDetails(p) {
     if (m) out.ean = m[1];
   }
 
-  // Data premiery: dokładna, format YYYY-MM-DD.
   if (!out.release_date) {
     const flat = html.replace(/\s+/g, " ");
-    const m =
-      flat.match(/(?:Data premiery|Premiera)\D{0,60}?(\d{4}-\d{2}-\d{2}|\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4})/i);
+    const m = flat.match(
+      /(?:Data premiery|Premiera)\D{0,60}?(\d{4}-\d{2}-\d{2}|\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4})/i
+    );
     if (m) out.release_date = normalizeDate(m[1]);
   }
 
-  // Autor: WYŁĄCZNIE z JSON-LD (obsłużone wyżej). Nie pobieramy z breadcrumbów,
-  // linków katalogowych ani og:title — tam bywa odwrócona forma "Nazwisko Imię".
-
-  // Jeśli tytuł nadal zawiera doklejoną końcówkę " - Coś" (np. z og:title),
-  // ucinamy ją z TYTUŁU, ale NIE traktujemy jako autora.
+  // Tytuł: ucinamy doklejoną końcówkę " - Coś", ale nie traktujemy jej jako autora.
   if (out.title && out.title.includes(" - ")) {
     const idx = out.title.lastIndexOf(" - ");
     const tail = cleanText(out.title.slice(idx + 3), 200);
-    // ucinamy tylko wyraźną końcówkę autorską (krótka, bez cyfr, nie podtytuł/tom)
     if (tail.length <= 60 && !/\d/.test(tail) && !/tom|część|wyd\.|wydanie/i.test(tail)) {
       out.title = cleanText(out.title.slice(0, idx), 300);
     }
   }
 
-  // Kompletność: wpis jest pełny tylko z tytułem, autorem (z JSON-LD),
-  // okładką (ecsmedia.pl) i EAN-em. Bez któregokolwiek details_ok=false
-  // i kolejne runy spróbują uzupełnić. Lepiej puste niż błędne/odwrócone.
   out.details_ok = Boolean(out.title && out.author && out.cover_url && out.ean);
   return out;
-}
-
-// Okładka jest ważna tylko, gdy pochodzi z CDN obrazków Empiku (ecsmedia.pl).
-function isValidCover(u) {
-  if (!u) return false;
-  try {
-    return new URL(u).host.includes("ecsmedia.pl");
-  } catch {
-    return false;
-  }
 }
 
 // ---------- Main ----------
@@ -355,79 +276,112 @@ async function main() {
     throw new Error("Brak sekretów SUPABASE_URL / SUPABASE_SERVICE_KEY");
   }
 
-  // 0. Rozgrzewka — pobierz sesyjne ciasteczka Empiku
-  await warmUp();
+  const browser = await chromium.launch({
+    args: ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+  });
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    locale: "pl-PL",
+    viewport: { width: 1366, height: 900 },
+    extraHTTPHeaders: { "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8" },
+  });
+  const page = await context.newPage();
 
-  // 1. Listing
-  const all = new Map();
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const start = page * RESULTS_PER_PAGE + 1;
+  try {
+    // 0. Rozgrzewka
     try {
-      const html = await fetchListingPage(start);
-      const products = parseListing(html);
-      console.log(`Strona start=${start}: ${products.size} produktów`);
-      if (products.size === 0) break;
-      for (const [id, p] of products) all.set(id, p);
-      await sleep(2500 + Math.random() * 2000);
+      const resp = await page.goto("https://www.empik.com/", {
+        waitUntil: "domcontentloaded",
+        timeout: 45000,
+      });
+      console.log(`Rozgrzewka: HTTP ${resp ? resp.status() : "?"}`);
+      for (const sel of [
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Akceptuję')",
+        "button:has-text('Zgadzam')",
+      ]) {
+        try {
+          await page.click(sel, { timeout: 2000 });
+          break;
+        } catch {}
+      }
+      await sleep(1500);
     } catch (e) {
-      console.error(`Błąd strony start=${start}: ${e.message}`);
-      if (page === 0) throw e;
-      break;
+      console.warn(`Rozgrzewka nieudana: ${e.message}`);
     }
-  }
-  if (all.size === 0) throw new Error("Pusty listing — możliwa blokada/zmiana HTML.");
 
-  // 2. Co już mamy w bazie
-  const existing = await getExisting();
-  const newOnes = [...all.values()].filter((p) => !existing.has(p.id));
-  const needBackfill = [...all.values()].filter(
-    (p) => existing.has(p.id) && existing.get(p.id) === false
-  );
-  console.log(
-    `\nListing: ${all.size} | nowych: ${newOnes.length} | do uzupełnienia: ${needBackfill.length}`
-  );
-
-  // 3. Nowe bez szczegółów wrzucamy od razu (żeby nic nie zginęło),
-  //    szczegóły doczytujemy w ramach budżetu
-  await upsertRows(
-    newOnes.map((p) => ({ id: p.id, title: p.title, url: p.url }))
-  );
-
-  const queue = [...newOnes, ...needBackfill].slice(0, DETAILS_BUDGET);
-  let done = 0;
-  for (const p of queue) {
-    try {
-      const d = await fetchProductDetails(p);
-      // title jest NOT NULL w bazie — awaryjnie użyj tytułu z listingu
-      const safeTitle = d.title || cleanText(p.title, 300);
-      await upsertRows([
-        {
-          id: p.id,
-          url: p.url,
-          title: safeTitle,
-          author: d.author,
-          cover_url: d.cover_url,
-          ean: d.ean,
-          release_date: d.release_date,
-          description: d.description,
-          category: d.category,
-          details_ok: d.details_ok,
-          updated_at: new Date().toISOString(),
-        },
-      ]);
-      done++;
-      console.log(
-        `  ✓ ${safeTitle}${d.author ? ` — ${d.author}` : ""}${d.release_date ? ` (${d.release_date})` : ""}${d.details_ok ? "" : " [niepełne]"}`
-      );
-    } catch (e) {
-      console.error(`  ✗ ${p.title}: ${e.message}`);
+    // 1. Listing
+    const all = new Map();
+    for (let pageNo = 0; pageNo < MAX_PAGES; pageNo++) {
+      const start = pageNo * RESULTS_PER_PAGE + 1;
+      const url = `${LISTING_URL}&resultsPP=${RESULTS_PER_PAGE}&start=${start}`;
+      try {
+        const html = await getHtml(page, url, { waitFor: "a[href*=',p']" });
+        const products = parseListing(html);
+        console.log(`Strona start=${start}: ${products.size} produktów`);
+        if (products.size === 0) break;
+        for (const [id, p] of products) all.set(id, p);
+        await sleep(2000 + Math.random() * 2000);
+      } catch (e) {
+        console.error(`Błąd strony start=${start}: ${e.message}`);
+        if (pageNo === 0) throw e;
+        break;
+      }
     }
-    await sleep(1800 + Math.random() * 1200);
-  }
+    if (all.size === 0) throw new Error("Pusty listing — możliwa blokada/zmiana HTML.");
 
-  console.log(`\nSzczegóły pobrane: ${done}/${queue.length}`);
-  if (queue.length > DETAILS_BUDGET) {
-    console.log("Reszta zostanie uzupełniona w kolejnych runach.");
+    // 2. Diff
+    const existing = await getExisting();
+    const newOnes = [...all.values()].filter((p) => !existing.has(p.id));
+    const needBackfill = [...all.values()].filter(
+      (p) => existing.has(p.id) && existing.get(p.id) === false
+    );
+    console.log(
+      `\nListing: ${all.size} | nowych: ${newOnes.length} | do uzupełnienia: ${needBackfill.length}`
+    );
+
+    // 3. Nowe wrzucamy od razu (id+tytuł+url), szczegóły w budżecie
+    await upsertRows(newOnes.map((p) => ({ id: p.id, title: p.title, url: p.url })));
+
+    const queue = [...newOnes, ...needBackfill].slice(0, DETAILS_BUDGET);
+    let done = 0;
+    for (const p of queue) {
+      try {
+        const html = await getHtml(page, p.url, { waitFor: "script[type='application/ld+json']" });
+        const d = extractDetails(html);
+        const safeTitle = d.title || cleanText(p.title, 300);
+        await upsertRows([
+          {
+            id: p.id,
+            url: p.url,
+            title: safeTitle,
+            author: d.author,
+            cover_url: d.cover_url,
+            ean: d.ean,
+            release_date: d.release_date,
+            description: d.description,
+            category: d.category,
+            details_ok: d.details_ok,
+            updated_at: new Date().toISOString(),
+          },
+        ]);
+        done++;
+        console.log(
+          `  ✓ ${safeTitle}${d.author ? ` — ${d.author}` : ""}${d.release_date ? ` (${d.release_date})` : ""}${d.details_ok ? "" : " [niepełne]"}`
+        );
+      } catch (e) {
+        console.error(`  ✗ ${p.title}: ${e.message}`);
+      }
+      await sleep(1500 + Math.random() * 1500);
+    }
+
+    console.log(`\nSzczegóły pobrane: ${done}/${queue.length}`);
+    if (newOnes.length + needBackfill.length > DETAILS_BUDGET) {
+      console.log("Reszta zostanie uzupełniona w kolejnych runach.");
+    }
+  } finally {
+    await browser.close();
   }
 }
 
