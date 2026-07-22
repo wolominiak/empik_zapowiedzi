@@ -1,6 +1,8 @@
-// Empik Zapowiedzi → Supabase (zaczytajsie.pl) — wersja Playwright
-// Używa prawdziwej przeglądarki (headless Chromium), żeby ominąć blokadę 403
-// na stronach produktów. Logika parsowania i zapisu jak w wersji fetch.
+// Empik Zapowiedzi → Supabase (zaczytajsie.pl) — wersja LISTING
+// Czyta komplet danych bezpośrednio z listingu zapowiedzi (bez wchodzenia na
+// strony produktów — te zwracają 403 z IP GitHub Actions). Z listingu bierzemy:
+// tytuł, autora, okładkę (ecsmedia.pl), kategorię, datę premiery, cenę.
+// EAN i pełny opis dociąga panel admina przy kliknięciu "Dodaj" (z IP użytkownika).
 //
 // Wymagane sekrety (env): SUPABASE_URL, SUPABASE_SERVICE_KEY
 
@@ -10,9 +12,8 @@ import * as cheerio from "cheerio";
 const LISTING_URL =
   "https://www.empik.com/zapowiedzi?searchCategory=31&hideUnavailable=true&sort=scoreDesc&availabilitySeparable=przedsprzedaz&qtype=facetForm";
 
-const MAX_PAGES = 8; // 8 × 50 = do 400 pozycji (stop na pustej stronie)
+const MAX_PAGES = 10; // 10 × 50 = do 500 pozycji (stop na pustej stronie)
 const RESULTS_PER_PAGE = 50;
-const DETAILS_BUDGET = 60; // max stron produktowych na jeden run
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -39,18 +40,16 @@ async function sb(path, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-async function getExisting() {
-  const map = new Map();
+async function getExistingIds() {
+  const ids = new Set();
   let from = 0;
   while (true) {
-    const rows = await sb(
-      `empik_proposals?select=id,details_ok&order=id&limit=1000&offset=${from}`
-    );
-    for (const r of rows) map.set(r.id, r.details_ok);
+    const rows = await sb(`empik_proposals?select=id&order=id&limit=1000&offset=${from}`);
+    for (const r of rows) ids.add(r.id);
     if (rows.length < 1000) break;
     from += 1000;
   }
-  return map;
+  return ids;
 }
 
 async function upsertRows(rows) {
@@ -62,75 +61,20 @@ async function upsertRows(rows) {
   });
 }
 
-// ---------- Pobieranie przez przeglądarkę ----------
+// ---------- Helpery ----------
 
-async function getHtml(page, url, { waitFor } = {}) {
-  const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-  const status = resp ? resp.status() : 0;
-  if (status === 403 || status === 429) {
-    await sleep(4000 + Math.random() * 3000);
-    const resp2 = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
-    if (resp2 && (resp2.status() === 403 || resp2.status() === 429)) {
-      throw new Error(`HTTP ${resp2.status()}`);
-    }
-  }
-  if (waitFor) {
-    try {
-      await page.waitForSelector(waitFor, { timeout: 8000 });
-    } catch {}
-  }
-  await sleep(400);
-  return await page.content();
+function cleanText(s, max) {
+  return (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
 }
-
-// ---------- Listing ----------
-
-function parseListing(html) {
-  const $ = cheerio.load(html);
-  const products = new Map();
-  $("a[href*=',p']").each((_, el) => {
-    const href = $(el).attr("href") || "";
-    const m = href.match(/,(p\d{6,}),/);
-    if (!m) return;
-    const id = m[1];
-    let title =
-      $(el).attr("title") ||
-      $(el).find("[class*='title'], strong, span").first().text().trim() ||
-      $(el).text().trim();
-    title = title.replace(/\s+/g, " ").trim();
-    const existing = products.get(id);
-    if (!existing || (title && title.length > existing.title.length)) {
-      products.set(id, {
-        id,
-        title: title.slice(0, 300),
-        url: `https://www.empik.com${href.split("?")[0]}`,
-      });
-    }
-  });
-  return products;
-}
-
-// ---------- Helpery parsujące ----------
 
 function normalizeDate(s) {
   if (!s) return null;
   s = s.trim();
-  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  let m = s.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = s.match(/^(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
+  m = s.match(/(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{4})/);
   if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   return null;
-}
-
-function cleanText(s, max) {
-  return (s || "").replace(/\s+/g, " ").trim().slice(0, max);
-}
-
-function cleanOgTitle(raw) {
-  let t = cleanText(raw, 400);
-  t = t.replace(/\s*\|\s*Empik(\.com)?\s*$/i, "");
-  t = t.replace(/\s*-\s*Książka\s*$/i, "");
-  return cleanText(t, 300);
 }
 
 function upscaleCover(u) {
@@ -150,123 +94,121 @@ function isValidCover(u) {
   }
 }
 
-// ---------- Strona produktu: komplet danych ----------
+// Kategoria z "Książki/Literatura obyczajowa/Literatura obyczajowa"
+// → bierzemy ostatni, najbardziej szczegółowy człon (bez wiodącego "Książki").
+function pickCategory(raw) {
+  if (!raw) return null;
+  const parts = cleanText(raw, 200)
+    .split("/")
+    .map((s) => s.trim())
+    .filter((s) => s && !/^książki$/i.test(s));
+  if (parts.length === 0) return null;
+  return cleanText(parts[parts.length - 1], 80);
+}
 
-function extractDetails(html) {
-  const out = {
-    author: null,
-    cover_url: null,
-    ean: null,
-    release_date: null,
-    description: null,
-    category: null,
-    title: null,
-    details_ok: false,
-  };
-  const SKIP_CRUMBS = new Set([
-    "empik", "empik.com", "strona główna", "książki", "ksiazki",
-    "zapowiedzi", "przedsprzedaż", "bestsellery", "nowości", "promocje",
-  ]);
+// ---------- Parsowanie listingu ----------
 
+function parseListing(html) {
   const $ = cheerio.load(html);
+  const out = new Map();
 
-  // 1) JSON-LD: Product / Book / BreadcrumbList
-  $("script[type='application/ld+json']").each((_, el) => {
-    let data;
-    try {
-      data = JSON.parse($(el).contents().text());
-    } catch {
-      return;
+  $(".search-list-item").each((_, el) => {
+    const $el = $(el);
+
+    // ID produktu
+    const id =
+      $el.attr("data-product-id") ||
+      ($el.find("[data-product-id]").first().attr("data-product-id") || "");
+    if (!id || !/^p\d{6,}$/.test(id)) return;
+
+    // Link do produktu
+    let href = $el.find("a[href*=',p']").first().attr("href") || "";
+    if (!href) href = $el.find("a[href*='ksiazka']").first().attr("href") || "";
+    const url = href
+      ? `https://www.empik.com${href.split("?")[0]}`
+      : `https://www.empik.com/,${id},ksiazka-p`;
+
+    // Tytuł + autor: z atrybutu title linku okładki ("Tytuł - Autor")
+    // lub z data-product-name (sam tytuł).
+    const linkTitle = cleanText(
+      $el.find("a[title]").first().attr("title") ||
+        $el.find("img[title]").first().attr("title"),
+      400
+    );
+    const dataName = cleanText($el.attr("data-product-name"), 300);
+
+    let title = null;
+    let author = null;
+    if (linkTitle && linkTitle.includes(" - ")) {
+      const idx = linkTitle.lastIndexOf(" - ");
+      title = cleanText(linkTitle.slice(0, idx), 300);
+      author = cleanText(linkTitle.slice(idx + 3), 200);
+    } else {
+      title = dataName || linkTitle || null;
     }
-    const nodes = [].concat(data).flatMap((d) => (d && d["@graph"] ? d["@graph"] : [d]));
-    for (const node of nodes) {
-      if (!node || !node["@type"]) continue;
-      const types = [].concat(node["@type"]);
+    if (!title) title = dataName || null;
+    if (!title) return; // bez tytułu pomijamy
 
-      if (types.includes("Product") || types.includes("Book")) {
-        if (node.name && !out.title) out.title = cleanText(node.name, 300);
-        if (node.description) out.description = cleanText(node.description, 3000);
-        const img = Array.isArray(node.image) ? node.image[0] : node.image;
-        const imgUrl = typeof img === "string" ? img : img?.url || null;
-        if (imgUrl && !out.cover_url) out.cover_url = imgUrl;
-        const eanCand = String(node.gtin13 || node.gtin || node.isbn || "").replace(/\D/g, "");
-        if (!out.ean && /^\d{13}$/.test(eanCand)) out.ean = eanCand;
-        const rd = node.releaseDate || node.datePublished;
-        if (rd) out.release_date = normalizeDate(String(rd)) || out.release_date;
-        // Autor WYŁĄCZNIE z JSON-LD (naturalna forma "Imię Nazwisko")
-        const authors = [].concat(node.author || []).map((a) =>
-          typeof a === "string" ? a : a?.name || ""
-        );
-        const authorStr = authors.filter(Boolean).join(", ");
-        if (authorStr && !out.author) out.author = cleanText(authorStr, 200);
-      }
+    // Okładka: meta itemprop=image albo img (src / lazy-img), host ecsmedia.pl
+    let cover =
+      $el.find("meta[itemprop='image']").first().attr("content") ||
+      $el.find("img").first().attr("lazy-img") ||
+      $el.find("img").first().attr("data-src") ||
+      $el.find("img").first().attr("src") ||
+      null;
+    cover = isValidCover(cover) ? upscaleCover(cover) : null;
 
-      if (types.includes("BreadcrumbList")) {
-        const crumbs = (node.itemListElement || [])
-          .sort((a, b) => (a.position || 0) - (b.position || 0))
-          .map((i) => cleanText(i.name || i.item?.name || "", 60))
-          .filter((c) => c && !SKIP_CRUMBS.has(c.toLowerCase()));
-        if (crumbs.length > 0) {
-          const last = crumbs[crumbs.length - 1];
-          out.category =
-            crumbs.length >= 2 && last.length > 40 ? crumbs[crumbs.length - 2] : last;
-        }
-      }
+    // Kategoria
+    const category = pickCategory($el.attr("data-product-category"));
+
+    // Data premiery: z data-delivery ("zapowiedź, premiera: 29.07.2026")
+    // albo z dowolnego atrybutu/tekstu ze słowem "premiera".
+    let release_date = null;
+    const delivery =
+      $el.attr("data-delivery") ||
+      $el.find("[data-delivery]").first().attr("data-delivery") ||
+      "";
+    if (/premiera/i.test(delivery)) release_date = normalizeDate(delivery);
+    if (!release_date) {
+      const txt = $el.text().replace(/\s+/g, " ");
+      const m = txt.match(/premiera[:\s]*(\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4}|\d{4}-\d{2}-\d{2})/i);
+      if (m) release_date = normalizeDate(m[1]);
     }
+
+    // Kompletność na poziomie listingu: tytuł + autor + okładka + kategoria.
+    // (EAN i opis dociąga panel przy "Dodaj".)
+    const details_ok = Boolean(title && author && cover);
+
+    out.set(id, {
+      id,
+      url,
+      title,
+      author: author || null,
+      cover_url: cover,
+      category,
+      release_date,
+      details_ok,
+    });
   });
 
-  // 2) Fallbacki z meta/HTML
-  if (!out.category) {
-    const cat =
-      $("meta[property='product:category2']").attr("content") ||
-      $("meta[property='product:category']").attr("content");
-    if (cat) out.category = cleanText(cat, 80);
-  }
-
-  if (!out.title) {
-    const ogTitle = cleanOgTitle($("meta[property='og:title']").attr("content"));
-    if (ogTitle) out.title = ogTitle;
-  }
-
-  const ogImage = $("meta[property='og:image']").attr("content") || null;
-  const coverCandidate = ogImage || out.cover_url;
-  out.cover_url = isValidCover(coverCandidate) ? upscaleCover(coverCandidate) : null;
-
-  if (!out.description) {
-    out.description =
-      cleanText(
-        $("meta[property='og:description']").attr("content") ||
-          $("meta[name='description']").attr("content"),
-        3000
-      ) || null;
-  }
-
-  if (!out.ean) {
-    const detail = $("body").text().replace(/\s+/g, " ");
-    let m = detail.match(/\bEAN\D{0,15}(\d{13})\b/i) || detail.match(/\bISBN\D{0,15}(\d{13})\b/i);
-    if (!m) m = html.match(/\b(97[89]\d{10})\b/);
-    if (m) out.ean = m[1];
-  }
-
-  if (!out.release_date) {
-    const flat = html.replace(/\s+/g, " ");
-    const m = flat.match(
-      /(?:Data premiery|Premiera)\D{0,60}?(\d{4}-\d{2}-\d{2}|\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4})/i
-    );
-    if (m) out.release_date = normalizeDate(m[1]);
-  }
-
-  // Tytuł: ucinamy doklejoną końcówkę " - Coś", ale nie traktujemy jej jako autora.
-  if (out.title && out.title.includes(" - ")) {
-    const idx = out.title.lastIndexOf(" - ");
-    const tail = cleanText(out.title.slice(idx + 3), 200);
-    if (tail.length <= 60 && !/\d/.test(tail) && !/tom|część|wyd\.|wydanie/i.test(tail)) {
-      out.title = cleanText(out.title.slice(0, idx), 300);
-    }
-  }
-
-  out.details_ok = Boolean(out.title && out.author && out.cover_url && out.ean);
   return out;
+}
+
+// ---------- Pobieranie listingu przez przeglądarkę ----------
+
+async function getListingHtml(page, url) {
+  const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  if (resp && (resp.status() === 403 || resp.status() === 429)) {
+    await sleep(4000 + Math.random() * 3000);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+  }
+  try {
+    await page.waitForSelector(".search-list-item", { timeout: 10000 });
+  } catch {}
+  // przewiń, by dociągnąć leniwie ładowane okładki
+  await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
+  await sleep(800);
+  return await page.content();
 }
 
 // ---------- Main ----------
@@ -289,7 +231,7 @@ async function main() {
   const page = await context.newPage();
 
   try {
-    // 0. Rozgrzewka
+    // Rozgrzewka + baner cookies
     try {
       const resp = await page.goto("https://www.empik.com/", {
         waitUntil: "domcontentloaded",
@@ -306,23 +248,23 @@ async function main() {
           break;
         } catch {}
       }
-      await sleep(1500);
+      await sleep(1200);
     } catch (e) {
       console.warn(`Rozgrzewka nieudana: ${e.message}`);
     }
 
-    // 1. Listing
+    // Listing — wszystkie strony
     const all = new Map();
     for (let pageNo = 0; pageNo < MAX_PAGES; pageNo++) {
       const start = pageNo * RESULTS_PER_PAGE + 1;
       const url = `${LISTING_URL}&resultsPP=${RESULTS_PER_PAGE}&start=${start}`;
       try {
-        const html = await getHtml(page, url, { waitFor: "a[href*=',p']" });
-        const products = parseListing(html);
-        console.log(`Strona start=${start}: ${products.size} produktów`);
-        if (products.size === 0) break;
-        for (const [id, p] of products) all.set(id, p);
-        await sleep(2000 + Math.random() * 2000);
+        const html = await getListingHtml(page, url);
+        const items = parseListing(html);
+        console.log(`Strona start=${start}: ${items.size} pozycji`);
+        if (items.size === 0) break;
+        for (const [id, it] of items) if (!all.has(id)) all.set(id, it);
+        await sleep(1500 + Math.random() * 1500);
       } catch (e) {
         console.error(`Błąd strony start=${start}: ${e.message}`);
         if (pageNo === 0) throw e;
@@ -331,54 +273,43 @@ async function main() {
     }
     if (all.size === 0) throw new Error("Pusty listing — możliwa blokada/zmiana HTML.");
 
-    // 2. Diff
-    const existing = await getExisting();
-    const newOnes = [...all.values()].filter((p) => !existing.has(p.id));
-    const needBackfill = [...all.values()].filter(
-      (p) => existing.has(p.id) && existing.get(p.id) === false
-    );
-    console.log(
-      `\nListing: ${all.size} | nowych: ${newOnes.length} | do uzupełnienia: ${needBackfill.length}`
-    );
+    // Diff — ile nowych
+    const existing = await getExistingIds();
+    const items = [...all.values()];
+    const newCount = items.filter((it) => !existing.has(it.id)).length;
+    console.log(`\nListing: ${items.size} | nowych: ${newCount}`);
 
-    // 3. Nowe wrzucamy od razu (id+tytuł+url), szczegóły w budżecie
-    await upsertRows(newOnes.map((p) => ({ id: p.id, title: p.title, url: p.url })));
+    // Upsert wszystkich (merge-duplicates nie ruszy statusu already-added/dismissed,
+    // bo tych pól nie wysyłamy). Zapisujemy komplet z listingu.
+    const now = new Date().toISOString();
+    const rows = items.map((it) => ({
+      id: it.id,
+      url: it.url,
+      title: it.title,
+      author: it.author,
+      cover_url: it.cover_url,
+      category: it.category,
+      release_date: it.release_date,
+      details_ok: it.details_ok,
+      updated_at: now,
+    }));
 
-    const queue = [...newOnes, ...needBackfill].slice(0, DETAILS_BUDGET);
-    let done = 0;
-    for (const p of queue) {
-      try {
-        const html = await getHtml(page, p.url, { waitFor: "script[type='application/ld+json']" });
-        const d = extractDetails(html);
-        const safeTitle = d.title || cleanText(p.title, 300);
-        await upsertRows([
-          {
-            id: p.id,
-            url: p.url,
-            title: safeTitle,
-            author: d.author,
-            cover_url: d.cover_url,
-            ean: d.ean,
-            release_date: d.release_date,
-            description: d.description,
-            category: d.category,
-            details_ok: d.details_ok,
-            updated_at: new Date().toISOString(),
-          },
-        ]);
-        done++;
-        console.log(
-          `  ✓ ${safeTitle}${d.author ? ` — ${d.author}` : ""}${d.release_date ? ` (${d.release_date})` : ""}${d.details_ok ? "" : " [niepełne]"}`
-        );
-      } catch (e) {
-        console.error(`  ✗ ${p.title}: ${e.message}`);
-      }
-      await sleep(1500 + Math.random() * 1500);
+    // wysyłamy paczkami po 100
+    for (let i = 0; i < rows.length; i += 100) {
+      await upsertRows(rows.slice(i, i + 100));
     }
 
-    console.log(`\nSzczegóły pobrane: ${done}/${queue.length}`);
-    if (newOnes.length + needBackfill.length > DETAILS_BUDGET) {
-      console.log("Reszta zostanie uzupełniona w kolejnych runach.");
+    const withCover = items.filter((it) => it.cover_url).length;
+    const withAuthor = items.filter((it) => it.author).length;
+    const withDate = items.filter((it) => it.release_date).length;
+    console.log(
+      `Zapisano ${rows.length} | z okładką: ${withCover} | z autorem: ${withAuthor} | z datą: ${withDate}`
+    );
+    // podgląd 10 pierwszych
+    for (const it of items.slice(0, 10)) {
+      console.log(
+        `  • ${it.title}${it.author ? ` — ${it.author}` : ""}${it.release_date ? ` (${it.release_date})` : ""}${it.cover_url ? "" : " [BRAK OKŁADKI]"}`
+      );
     }
   } finally {
     await browser.close();
