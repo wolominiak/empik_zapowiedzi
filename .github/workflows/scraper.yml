@@ -2,7 +2,7 @@ name: Empik zapowiedzi do Supabase
 
 on:
   schedule:
-    - cron: "43 10,15,20 * * *" # 3x dziennie (UTC)
+    - cron: "43 10,15,20 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -20,6 +20,9 @@ jobs:
           node-version: 24
 
       - run: npm install
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
 
       - name: Run scraper
         env:
