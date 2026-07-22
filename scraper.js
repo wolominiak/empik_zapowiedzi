@@ -256,27 +256,24 @@ async function fetchProductDetails(p) {
     if (m) out.release_date = normalizeDate(m[1]);
   }
 
-  // Autor: osobny element na stronie, jeśli JSON-LD nie dał.
-  if (!out.author) {
-    const a = $("a[href*='autorzy'], a[href*='autor']").first().text();
-    if (a) out.author = cleanText(a, 200);
-  }
+  // Autor: WYŁĄCZNIE z JSON-LD (obsłużone wyżej). Nie pobieramy z breadcrumbów,
+  // linków katalogowych ani og:title — tam bywa odwrócona forma "Nazwisko Imię".
 
-  // Ostateczne rozdzielenie sklejonego "Tytuł - Autor" (gdyby tytuł nadal go zawierał,
-  // a autora brakowało). Tytuł zostaje sam, autor trafia do swojego pola.
-  if (out.title && !out.author && out.title.includes(" - ")) {
+  // Jeśli tytuł nadal zawiera doklejoną końcówkę " - Coś" (np. z og:title),
+  // ucinamy ją z TYTUŁU, ale NIE traktujemy jako autora.
+  if (out.title && out.title.includes(" - ")) {
     const idx = out.title.lastIndexOf(" - ");
     const tail = cleanText(out.title.slice(idx + 3), 200);
-    // heurystyka: ogon wygląda jak nazwisko (krótki, bez cyfr), nie jak podtytuł
-    if (tail.length <= 60 && !/\d/.test(tail)) {
-      out.author = tail;
+    // ucinamy tylko wyraźną końcówkę autorską (krótka, bez cyfr, nie podtytuł/tom)
+    if (tail.length <= 60 && !/\d/.test(tail) && !/tom|część|wyd\.|wydanie/i.test(tail)) {
       out.title = cleanText(out.title.slice(0, idx), 300);
     }
   }
 
-  // Kompletność: wymagamy okładki (ecsmedia.pl) ORAZ EAN-u — to minimum,
-  // by wpis nadawał się do dodania. Bez tego details_ok=false i backfill spróbuje ponownie.
-  out.details_ok = Boolean(out.title && out.cover_url && out.ean);
+  // Kompletność: wpis jest pełny tylko z tytułem, autorem (z JSON-LD),
+  // okładką (ecsmedia.pl) i EAN-em. Bez któregokolwiek details_ok=false
+  // i kolejne runy spróbują uzupełnić. Lepiej puste niż błędne/odwrócone.
+  out.details_ok = Boolean(out.title && out.author && out.cover_url && out.ean);
   return out;
 }
 
