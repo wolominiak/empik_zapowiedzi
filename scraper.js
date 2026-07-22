@@ -21,12 +21,73 @@ const HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   "Accept":
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.8",
-  "Referer": "https://www.empik.com/",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "same-origin",
+  "Sec-Fetch-User": "?1",
+  "sec-ch-ua": '"Chromium";v="126", "Not:A-Brand";v="24", "Google Chrome";v="126"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Cache-Control": "max-age=0",
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Prosty magazyn ciasteczek — Empik ustawia sesyjne cookies na pierwszej
+// odsłonie i wymaga ich odesłania przy kolejnych żądaniach (inaczej 403).
+let COOKIE_JAR = "";
+
+function storeCookies(res) {
+  // Node fetch: nagłówki set-cookie dostępne przez getSetCookie()
+  const setCookies =
+    (res.headers.getSetCookie && res.headers.getSetCookie()) ||
+    (res.headers.raw && res.headers.raw()["set-cookie"]) ||
+    [];
+  if (!setCookies || setCookies.length === 0) return;
+  const jar = {};
+  for (const c of COOKIE_JAR.split("; ").filter(Boolean)) {
+    const [k, ...v] = c.split("=");
+    jar[k] = v.join("=");
+  }
+  for (const line of setCookies) {
+    const first = line.split(";")[0];
+    const [k, ...v] = first.split("=");
+    if (k) jar[k.trim()] = v.join("=");
+  }
+  COOKIE_JAR = Object.entries(jar)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+// Fetch z nagłówkami przeglądarki, ciasteczkami i ponawianiem przy 403/429.
+async function browserFetch(url, { referer } = {}, attempt = 0) {
+  const headers = { ...HEADERS };
+  if (referer) headers["Referer"] = referer;
+  if (COOKIE_JAR) headers["Cookie"] = COOKIE_JAR;
+  const res = await fetch(url, { headers, redirect: "follow" });
+  storeCookies(res);
+  if ((res.status === 403 || res.status === 429) && attempt < 3) {
+    await sleep(3000 + attempt * 3000 + Math.random() * 2000);
+    return browserFetch(url, { referer }, attempt + 1);
+  }
+  return res;
+}
+
+// Rozgrzewka: wejście na stronę główną, by pobrać sesyjne ciasteczka.
+async function warmUp() {
+  try {
+    const res = await browserFetch("https://www.empik.com/");
+    console.log(`Rozgrzewka: HTTP ${res.status}, cookies: ${COOKIE_JAR ? "tak" : "brak"}`);
+    await sleep(1500 + Math.random() * 1500);
+  } catch (e) {
+    console.warn(`Rozgrzewka nieudana: ${e.message}`);
+  }
+}
+
 
 // ---------- Supabase (REST, bez zależności) ----------
 
@@ -76,7 +137,7 @@ async function upsertRows(rows) {
 
 async function fetchListingPage(startPos) {
   const url = `${LISTING_URL}&resultsPP=${RESULTS_PER_PAGE}&start=${startPos}`;
-  const res = await fetch(url, { headers: HEADERS });
+  const res = await browserFetch(url, { referer: "https://www.empik.com/" });
   if (!res.ok) throw new Error(`HTTP ${res.status} dla start=${startPos}`);
   return await res.text();
 }
@@ -158,7 +219,7 @@ async function fetchProductDetails(p) {
     "zapowiedzi", "przedsprzedaż", "bestsellery", "nowości", "promocje",
   ]);
 
-  const res = await fetch(p.url, { headers: HEADERS });
+  const res = await browserFetch(p.url, { referer: LISTING_URL });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const html = await res.text();
   const $ = cheerio.load(html);
@@ -293,6 +354,9 @@ async function main() {
   if (!SUPABASE_URL || !SUPABASE_KEY) {
     throw new Error("Brak sekretów SUPABASE_URL / SUPABASE_SERVICE_KEY");
   }
+
+  // 0. Rozgrzewka — pobierz sesyjne ciasteczka Empiku
+  await warmUp();
 
   // 1. Listing
   const all = new Map();
