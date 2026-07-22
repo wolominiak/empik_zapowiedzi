@@ -122,6 +122,26 @@ function cleanText(s, max) {
   return (s || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+// Czyści tytuł z og:title: ucina końcówki typu " - Autor", " - Książka",
+// oraz sufiks " | Empik.com" / " | Empik".
+function cleanOgTitle(raw) {
+  let t = cleanText(raw, 400);
+  t = t.replace(/\s*\|\s*Empik(\.com)?\s*$/i, "");
+  // "Tytuł - Książka" → "Tytuł"
+  t = t.replace(/\s*-\s*Książka\s*$/i, "");
+  return cleanText(t, 300);
+}
+
+// Empik w og:image podaje URL z parametrem rozmiaru (np. ...,w-360).
+// Podnosimy do największego dostępnego wariantu.
+function upscaleCover(u) {
+  if (!u) return u;
+  return u
+    .replace(/,(?:w|h)-\d+/gi, "")           // usuń parametry rozmiaru w slug
+    .replace(/([?&])(?:w|h|width|height|size)=\d+/gi, "$1") // i w query
+    .replace(/[?&]+$/, "");
+}
+
 async function fetchProductDetails(p) {
   const out = {
     author: null,
@@ -130,7 +150,7 @@ async function fetchProductDetails(p) {
     release_date: null,
     description: null,
     category: null,
-    title: p.title,
+    title: null, // ustalamy ze strony produktu (JSON-LD/og:title), nie z listingu
     details_ok: false,
   };
   const SKIP_CRUMBS = new Set([
@@ -157,18 +177,21 @@ async function fetchProductDetails(p) {
       const types = [].concat(node["@type"]);
 
       if (types.includes("Product") || types.includes("Book")) {
-        if (node.name) out.title = cleanText(node.name, 300);
+        if (node.name && !out.title) out.title = cleanText(node.name, 300);
         if (node.description) out.description = cleanText(node.description, 3000);
         const img = Array.isArray(node.image) ? node.image[0] : node.image;
-        if (img) out.cover_url = typeof img === "string" ? img : img.url || null;
-        out.ean = out.ean || node.gtin13 || node.gtin || node.isbn || null;
+        const imgUrl = typeof img === "string" ? img : img?.url || null;
+        if (imgUrl && !out.cover_url) out.cover_url = imgUrl;
+        // EAN: akceptujemy tylko poprawny 13-cyfrowy kod
+        const eanCand = String(node.gtin13 || node.gtin || node.isbn || "").replace(/\D/g, "");
+        if (!out.ean && /^\d{13}$/.test(eanCand)) out.ean = eanCand;
         const rd = node.releaseDate || node.datePublished;
         if (rd) out.release_date = normalizeDate(String(rd)) || out.release_date;
         const authors = [].concat(node.author || []).map((a) =>
           typeof a === "string" ? a : a?.name || ""
         );
         const authorStr = authors.filter(Boolean).join(", ");
-        if (authorStr) out.author = cleanText(authorStr, 200);
+        if (authorStr && !out.author) out.author = cleanText(authorStr, 200);
       }
 
       if (types.includes("BreadcrumbList")) {
@@ -185,10 +208,30 @@ async function fetchProductDetails(p) {
     }
   });
 
-  // 2) Fallbacki z HTML
-  if (!out.cover_url) {
-    out.cover_url = $("meta[property='og:image']").attr("content") || null;
+  // 2) Fallbacki i doprecyzowanie z HTML/meta
+
+  // Kategoria: surowa z meta product:category2 (np. "Kryminał, sensacja, thriller").
+  // NIE mapujemy tu na gatunki portalu — to robi panel admina.
+  if (!out.category) {
+    const cat =
+      $("meta[property='product:category2']").attr("content") ||
+      $("meta[property='product:category']").attr("content");
+    if (cat) out.category = cleanText(cat, 80);
   }
+  // Fallback kategorii: przedostatni okruszek z breadcrumbów (już policzony wyżej)
+
+  // Tytuł: jeśli JSON-LD nie dał, bierzemy og:title z uciętą końcówką " - Autor"/" - Książka".
+  if (!out.title) {
+    const ogTitle = cleanOgTitle($("meta[property='og:title']").attr("content"));
+    if (ogTitle) out.title = ogTitle;
+  }
+
+  // Okładka: og:image z hosta ecsmedia.pl, podniesiona do największego rozmiaru.
+  const ogImage = $("meta[property='og:image']").attr("content") || null;
+  const coverCandidate = ogImage || out.cover_url;
+  out.cover_url = isValidCover(coverCandidate) ? upscaleCover(coverCandidate) : null;
+
+  // Opis: pełny ze strony; og:description tylko jako ostateczność (bywa skrócony).
   if (!out.description) {
     out.description = cleanText(
       $("meta[property='og:description']").attr("content") ||
@@ -196,30 +239,55 @@ async function fetchProductDetails(p) {
       3000
     ) || null;
   }
+
+  // EAN: 13 cyfr; szukamy w sekcji szczegółów, potem w całym HTML.
   if (!out.ean) {
-    const m = html.match(/\b(97[89]\d{10})\b/);
+    const detail = $("body").text().replace(/\s+/g, " ");
+    let m = detail.match(/\bEAN\D{0,15}(\d{13})\b/i) || detail.match(/\bISBN\D{0,15}(\d{13})\b/i);
+    if (!m) m = html.match(/\b(97[89]\d{10})\b/);
     if (m) out.ean = m[1];
   }
+
+  // Data premiery: dokładna, format YYYY-MM-DD.
   if (!out.release_date) {
-    const m = html
-      .replace(/\s+/g, " ")
-      .match(/Data premiery\D{0,60}?(\d{4}-\d{2}-\d{2}|\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4})/i);
+    const flat = html.replace(/\s+/g, " ");
+    const m =
+      flat.match(/(?:Data premiery|Premiera)\D{0,60}?(\d{4}-\d{2}-\d{2}|\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{4})/i);
     if (m) out.release_date = normalizeDate(m[1]);
   }
+
+  // Autor: osobny element na stronie, jeśli JSON-LD nie dał.
   if (!out.author) {
-    const a = $("a[href*='autor']").first().text();
+    const a = $("a[href*='autorzy'], a[href*='autor']").first().text();
     if (a) out.author = cleanText(a, 200);
   }
 
-  // Rozdziel "Tytuł - Autor" z listingu, jeśli autor dalej nieznany
-  if (!out.author && out.title.includes(" - ")) {
+  // Ostateczne rozdzielenie sklejonego "Tytuł - Autor" (gdyby tytuł nadal go zawierał,
+  // a autora brakowało). Tytuł zostaje sam, autor trafia do swojego pola.
+  if (out.title && !out.author && out.title.includes(" - ")) {
     const idx = out.title.lastIndexOf(" - ");
-    out.author = cleanText(out.title.slice(idx + 3), 200);
-    out.title = cleanText(out.title.slice(0, idx), 300);
+    const tail = cleanText(out.title.slice(idx + 3), 200);
+    // heurystyka: ogon wygląda jak nazwisko (krótki, bez cyfr), nie jak podtytuł
+    if (tail.length <= 60 && !/\d/.test(tail)) {
+      out.author = tail;
+      out.title = cleanText(out.title.slice(0, idx), 300);
+    }
   }
 
-  out.details_ok = Boolean(out.ean || out.release_date || out.description);
+  // Kompletność: wymagamy okładki (ecsmedia.pl) ORAZ EAN-u — to minimum,
+  // by wpis nadawał się do dodania. Bez tego details_ok=false i backfill spróbuje ponownie.
+  out.details_ok = Boolean(out.title && out.cover_url && out.ean);
   return out;
+}
+
+// Okładka jest ważna tylko, gdy pochodzi z CDN obrazków Empiku (ecsmedia.pl).
+function isValidCover(u) {
+  if (!u) return false;
+  try {
+    return new URL(u).host.includes("ecsmedia.pl");
+  } catch {
+    return false;
+  }
 }
 
 // ---------- Main ----------
@@ -269,11 +337,13 @@ async function main() {
   for (const p of queue) {
     try {
       const d = await fetchProductDetails(p);
+      // title jest NOT NULL w bazie — awaryjnie użyj tytułu z listingu
+      const safeTitle = d.title || cleanText(p.title, 300);
       await upsertRows([
         {
           id: p.id,
           url: p.url,
-          title: d.title,
+          title: safeTitle,
           author: d.author,
           cover_url: d.cover_url,
           ean: d.ean,
@@ -286,7 +356,7 @@ async function main() {
       ]);
       done++;
       console.log(
-        `  ✓ ${d.title}${d.author ? ` — ${d.author}` : ""}${d.release_date ? ` (${d.release_date})` : ""}${d.details_ok ? "" : " [niepełne]"}`
+        `  ✓ ${safeTitle}${d.author ? ` — ${d.author}` : ""}${d.release_date ? ` (${d.release_date})` : ""}${d.details_ok ? "" : " [niepełne]"}`
       );
     } catch (e) {
       console.error(`  ✗ ${p.title}: ${e.message}`);
