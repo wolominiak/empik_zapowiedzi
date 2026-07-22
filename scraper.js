@@ -277,7 +277,7 @@ async function main() {
     const existing = await getExistingIds();
     const items = [...all.values()];
     const newCount = items.filter((it) => !existing.has(it.id)).length;
-    console.log(`\nListing: ${items.size} | nowych: ${newCount}`);
+    console.log(`\nListing: ${items.length} | nowych: ${newCount}`);
 
     // Upsert wszystkich (merge-duplicates nie ruszy statusu already-added/dismissed,
     // bo tych pól nie wysyłamy). Zapisujemy komplet z listingu.
